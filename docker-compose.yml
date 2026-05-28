@@ -1,0 +1,34 @@
+services:
+  auto-transcode:
+    build: .
+    image: auto-transcode:local
+    container_name: auto-transcode
+    restart: unless-stopped
+    user: "33:33"
+    ports:
+      - "8128:8128"
+    environment:
+      TZ: America/Detroit
+      WATCHER_ENABLED: "true"
+      HOLD_FOR_APPROVAL: "false"
+      KEEP_ORIGINAL_BACKUP: "false"
+      X265_PRESET: "fast"
+      X265_CRF: "20"
+      DB_PATH: "/data/auto-transcode.db"
+      MEDIA_ROOTS: "/media/Movies,/media/Shows"
+      LOG_LEVEL: "INFO"
+    volumes:
+      - /media/nas/filip/ncdata/__groupfolders/5/files/Movies:/media/Movies
+      - /media/nas/filip/ncdata/__groupfolders/5/files/Shows:/media/Shows
+      - auto-transcode-data:/data
+    networks:
+      - default
+
+volumes:
+  auto-transcode-data:
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.42.0.0/24

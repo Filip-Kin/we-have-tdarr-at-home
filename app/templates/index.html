@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>We have tdarr at home</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <h1>We have tdarr at home</h1>
+    <div class="saved">
+      <span class="saved-label">Total saved</span>
+      <span class="saved-value" id="totalSaved">…</span>
+    </div>
+  </header>
+
+  <section class="config" id="config"></section>
+
+  <section class="active" id="activeSection">
+    <h2>Now transcoding</h2>
+    <div id="active"><p class="empty">Nothing running.</p></div>
+  </section>
+
+  <section class="pending" id="pendingSection" hidden>
+    <h2>Pending approval</h2>
+    <div id="pending"></div>
+  </section>
+
+  <section class="queue">
+    <h2>Queue <span class="count" id="queueCount">0</span></h2>
+    <div id="queue"></div>
+  </section>
+
+  <section class="done">
+    <h2>Completed <span class="count" id="doneCount">0</span></h2>
+    <table id="doneTable" hidden>
+      <thead>
+        <tr>
+          <th>File</th><th>Source</th><th>Output</th><th>Saved</th><th>%</th><th>When</th>
+        </tr>
+      </thead>
+      <tbody id="doneBody"></tbody>
+    </table>
+    <p class="empty" id="doneEmpty">No completed transcodes yet.</p>
+  </section>
+
+  <section class="failed" id="failedSection" hidden>
+    <h2>Failed / Discarded <span class="count" id="failedCount">0</span></h2>
+    <table id="failedTable">
+      <thead><tr><th>File</th><th>Status</th><th>Error</th></tr></thead>
+      <tbody id="failedBody"></tbody>
+    </table>
+  </section>
+
+  <footer>
+    <button id="scanBtn">Scan library</button>
+    <span id="scanMsg"></span>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

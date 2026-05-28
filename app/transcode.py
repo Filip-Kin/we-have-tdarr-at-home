@@ -171,12 +171,17 @@ def build_ffmpeg_cmd(
         "-c:v", "libx265",
         "-preset", preset,
         "-crf", str(crf),
-        "-maxrate", f"{maxrate_kbps}k",
-        "-bufsize", f"{bufsize_kbps}k",
+    ]
+
+    # VBV cap: pass via -x265-params so libx265 actually enforces it.
+    # ffmpeg's top-level -maxrate/-bufsize don't always propagate to libx265
+    # under CRF mode; vbv-maxrate/vbv-bufsize go straight to the encoder.
+    x265_params: list[str] = [
+        f"vbv-maxrate={maxrate_kbps}",
+        f"vbv-bufsize={bufsize_kbps}",
     ]
 
     # HDR10 preservation (libx265 needs explicit hdr-opt + color params)
-    x265_params: list[str] = []
     if p.is_hdr:
         cmd += [
             "-pix_fmt", "yuv420p10le",

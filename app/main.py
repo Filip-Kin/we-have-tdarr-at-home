@@ -298,17 +298,21 @@ def _process_job(job_id: int) -> None:
     cmd = transcode.build_ffmpeg_cmd(probed, dst, preset=X265_PRESET, crf=X265_CRF)
     update_job(job_id, dst_path=str(dst), ffmpeg_cmd=" ".join(cmd))
 
-    duration_us = max(1, int(probed.duration_sec * 1_000_000))
+    total_frames = probed.total_frames
+    duration_sec = probed.duration_sec
     last_db_update = 0.0
     last_stderr: list[str] = []
 
     def on_progress(u: transcode.ProgressUpdate) -> None:
         nonlocal last_db_update
-        pct = min(100.0, 100.0 * u.out_time_us / duration_us)
+        # Frame-based pct is more reliable than out_time_us, which ffmpeg 7.x
+        # often reports as "N/A" for the whole run on multi-stream encodes.
+        pct = min(100.0, 100.0 * u.frame / total_frames)
         eta = 0
-        if u.speed > 0 and u.out_time_us < duration_us:
-            remaining_us = duration_us - u.out_time_us
-            eta = int(remaining_us / 1_000_000 / u.speed)
+        if u.speed > 0 and u.frame < total_frames:
+            remaining_frames = total_frames - u.frame
+            remaining_content_sec = remaining_frames / probed.fps
+            eta = int(remaining_content_sec / u.speed)
         now = time.time()
         # Throttle DB writes to once per ~3 seconds; on done, always write.
         if u.done or now - last_db_update > 3:

@@ -70,6 +70,28 @@ class Probe:
         transfer = (self.video.get("color_transfer") or "").lower()
         return transfer in HDR_TRANSFERS
 
+    @property
+    def fps(self) -> float:
+        """Source video frame rate. Used to convert ffmpeg's frame counter
+        into a content-time pct (out_time_us is unreliable on multi-stream
+        encodes in ffmpeg 7.x -- often reported as 'N/A' for the whole run)."""
+        for key in ("avg_frame_rate", "r_frame_rate"):
+            v = self.video.get(key)
+            if not v or "/" not in str(v):
+                continue
+            num, den = str(v).split("/", 1)
+            try:
+                n, d = int(num), int(den)
+                if d > 0 and n > 0:
+                    return n / d
+            except ValueError:
+                continue
+        return 24.0
+
+    @property
+    def total_frames(self) -> int:
+        return max(1, int(self.duration_sec * self.fps))
+
     def find_default_english_audio_idx(self) -> int | None:
         """Returns the index (within self.audios) of the first audio stream
         tagged English. None if no English track exists."""
@@ -309,13 +331,15 @@ def run_ffmpeg(
     )
     assert proc.stdout and proc.stderr
     current = ProgressUpdate()
-    # Watchdog: if out_time_us hasn't advanced in STUCK_TIMEOUT_SEC, kill the
-    # process. Encoders occasionally wedge mid-stream (decoder hangs on a
-    # specific frame, etc.) and ffmpeg keeps the muxer queue draining audio
-    # while video stalls -- total_size grows but out_time freezes.
+    # Watchdog: kill the process if neither the frame counter nor total_size
+    # has advanced in STUCK_TIMEOUT_SEC. We can't rely on out_time_us alone
+    # because ffmpeg 7.x reports it as 'N/A' for the entire run on many
+    # multi-stream encodes (video + audio + subs). frame and total_size both
+    # advance under normal operation; a hang freezes both.
     STUCK_TIMEOUT_SEC = 900  # 15 minutes
     last_advance = time.time()
-    last_out_time_us = 0
+    last_frame = 0
+    last_total_size = 0
     killed_for_stuck = False
     try:
         # Use select to multiplex stdout (progress) + stderr (log lines).
@@ -327,8 +351,8 @@ def run_ffmpeg(
                 if proc.poll() is not None:
                     break
                 if time.time() - last_advance > STUCK_TIMEOUT_SEC:
-                    log.error("ffmpeg out_time stuck at %d us for >%ds, killing",
-                              last_out_time_us, STUCK_TIMEOUT_SEC)
+                    log.error("ffmpeg stuck (frame=%d total_size=%d) for >%ds, killing",
+                              last_frame, last_total_size, STUCK_TIMEOUT_SEC)
                     killed_for_stuck = True
                     proc.kill()
                     break
@@ -346,11 +370,12 @@ def run_ffmpeg(
                         elif k == "fps":
                             current.fps = _safe_float(v)
                         elif k == "out_time_us" or k == "out_time_ms":
-                            # ffmpeg's out_time_ms is actually microseconds (named badly)
-                            current.out_time_us = _safe_int(v)
-                            if current.out_time_us > last_out_time_us:
-                                last_out_time_us = current.out_time_us
-                                last_advance = time.time()
+                            # ffmpeg's out_time_ms is actually microseconds (named badly).
+                            # Treat "N/A" (common in multi-stream encodes) as "no update"
+                            # rather than overwriting with 0.
+                            new_ot = _safe_int(v)
+                            if new_ot > 0:
+                                current.out_time_us = new_ot
                         elif k == "speed":
                             current.speed = _safe_float(v.rstrip("x"))
                         elif k == "bitrate":
@@ -360,6 +385,12 @@ def run_ffmpeg(
                         elif k == "progress":
                             current.done = (v.strip() == "end")
                             on_progress(current)
+                            # Mark progress as advancing if either signal moved.
+                            if (current.frame > last_frame
+                                    or current.total_size > last_total_size):
+                                last_frame = current.frame
+                                last_total_size = current.total_size
+                                last_advance = time.time()
                             current = ProgressUpdate(frame=current.frame,
                                                     fps=current.fps,
                                                     out_time_us=current.out_time_us,
@@ -372,8 +403,8 @@ def run_ffmpeg(
             # Watchdog check after handling a batch of progress lines too,
             # so we don't have to wait for a select timeout to notice.
             if time.time() - last_advance > STUCK_TIMEOUT_SEC:
-                log.error("ffmpeg out_time stuck at %d us for >%ds, killing",
-                          last_out_time_us, STUCK_TIMEOUT_SEC)
+                log.error("ffmpeg stuck (frame=%d total_size=%d) for >%ds, killing",
+                          last_frame, last_total_size, STUCK_TIMEOUT_SEC)
                 killed_for_stuck = True
                 proc.kill()
                 break

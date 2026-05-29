@@ -107,13 +107,17 @@ def probe(path: Path) -> Probe:
     )
 
 
-def maxrate_for_height(height: int) -> tuple[int, int]:
-    """Returns (maxrate_kbps, bufsize_kbps) for given video height."""
-    if height >= 2000:
+def maxrate_for_video(p: Probe) -> tuple[int, int]:
+    """Returns (maxrate_kbps, bufsize_kbps) sized for the larger video
+    dimension, so cinemascope 4K (e.g. 3840x1608) gets the 4K tier rather
+    than being lumped in with 1080p. Thresholds are set just under the
+    canonical longest-side of each tier to handle slightly-cropped masters."""
+    longest = max(int(p.video.get("width") or 0), int(p.video.get("height") or 0))
+    if longest >= 3200:  # 4K UHD (3840 wide)
         return 20_000, 40_000
-    if height >= 1000:
+    if longest >= 1700:  # 1080p (1920 wide)
         return 8_000, 16_000
-    if height >= 700:
+    if longest >= 1200:  # 720p (1280 wide)
         return 4_000, 8_000
     return 2_000, 4_000
 
@@ -124,7 +128,7 @@ def needs_transcode(p: Probe) -> tuple[bool, str]:
         return True, f"container={p.container}, want mkv"
     if p.video_codec not in ("hevc", "vp9"):
         return True, f"codec={p.video_codec}, want hevc/vp9"
-    cap_kbps, _ = maxrate_for_height(p.height)
+    cap_kbps, _ = maxrate_for_video(p)
     bitrate_kbps = p.video_bitrate_bps // 1000
     if bitrate_kbps > cap_kbps * 1.1:
         return True, f"bitrate={bitrate_kbps}kbps > cap={cap_kbps}kbps"
@@ -138,7 +142,7 @@ def build_ffmpeg_cmd(
     crf: int = 22,
 ) -> list[str]:
     """Construct the full ffmpeg command for transcoding p to output_path."""
-    maxrate_kbps, bufsize_kbps = maxrate_for_height(p.height)
+    maxrate_kbps, bufsize_kbps = maxrate_for_video(p)
 
     cmd: list[str] = [
         "ffmpeg", "-y", "-hide_banner",
@@ -305,6 +309,14 @@ def run_ffmpeg(
     )
     assert proc.stdout and proc.stderr
     current = ProgressUpdate()
+    # Watchdog: if out_time_us hasn't advanced in STUCK_TIMEOUT_SEC, kill the
+    # process. Encoders occasionally wedge mid-stream (decoder hangs on a
+    # specific frame, etc.) and ffmpeg keeps the muxer queue draining audio
+    # while video stalls -- total_size grows but out_time freezes.
+    STUCK_TIMEOUT_SEC = 900  # 15 minutes
+    last_advance = time.time()
+    last_out_time_us = 0
+    killed_for_stuck = False
     try:
         # Use select to multiplex stdout (progress) + stderr (log lines).
         # Drop fds as they hit EOF so we don't busy-loop on closed pipes.
@@ -313,6 +325,12 @@ def run_ffmpeg(
             ready, _, _ = select.select(fds, [], [], 0.5)
             if not ready:
                 if proc.poll() is not None:
+                    break
+                if time.time() - last_advance > STUCK_TIMEOUT_SEC:
+                    log.error("ffmpeg out_time stuck at %d us for >%ds, killing",
+                              last_out_time_us, STUCK_TIMEOUT_SEC)
+                    killed_for_stuck = True
+                    proc.kill()
                     break
                 continue
             for f in ready:
@@ -330,6 +348,9 @@ def run_ffmpeg(
                         elif k == "out_time_us" or k == "out_time_ms":
                             # ffmpeg's out_time_ms is actually microseconds (named badly)
                             current.out_time_us = _safe_int(v)
+                            if current.out_time_us > last_out_time_us:
+                                last_out_time_us = current.out_time_us
+                                last_advance = time.time()
                         elif k == "speed":
                             current.speed = _safe_float(v.rstrip("x"))
                         elif k == "bitrate":
@@ -348,9 +369,22 @@ def run_ffmpeg(
                                                     done=current.done)
                 elif on_stderr_line is not None:
                     on_stderr_line(line.rstrip("\n"))
+            # Watchdog check after handling a batch of progress lines too,
+            # so we don't have to wait for a select timeout to notice.
+            if time.time() - last_advance > STUCK_TIMEOUT_SEC:
+                log.error("ffmpeg out_time stuck at %d us for >%ds, killing",
+                          last_out_time_us, STUCK_TIMEOUT_SEC)
+                killed_for_stuck = True
+                proc.kill()
+                break
     finally:
         proc.wait()
-    return proc.returncode
+    rc = proc.returncode
+    # Surface the stuck-kill as a distinct non-zero return so the worker can
+    # log a useful error_msg rather than a generic ffmpeg failure.
+    if killed_for_stuck and rc != 0:
+        rc = 124  # convention: 124 = watchdog timeout (matches GNU `timeout`)
+    return rc
 
 
 def verify_output(src: Probe, dst_path: Path) -> tuple[bool, str]:

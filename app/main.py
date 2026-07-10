@@ -173,6 +173,51 @@ def _allowed(path: Path) -> bool:
     return fnmatch.fnmatch(str(path), spec) or spec.replace("**/", "") in str(path)
 
 
+def _is_work_file(p: Path) -> bool:
+    """True if p is one of our own intermediate files (not a real media
+    source). These carry a video extension (e.g. ``foo.transcoding.mkv``), so
+    both the scan and the watcher would otherwise re-enqueue them as if they
+    were new inputs -- producing ``.transcoding.transcoding.mkv`` cascades and
+    junk queue entries. Never treat them as sources."""
+    name = p.name
+    return (".transcoding." in name
+            or ".audiofix." in name
+            or name.endswith(".to-delete")
+            or ".original-" in name)
+
+
+def consider_file(p: Path, reason_source: str) -> str:
+    """Probe one file and decide its fate under the single shared policy:
+    enqueue for transcode only if it exceeds the bitrate cap, otherwise apply
+    the cheap English-default audio fix (metadata-only, no re-encode). Both the
+    scan and the watcher route through here so they honor the same gate -- the
+    watcher used to enqueue every new file unconditionally, which re-encoded
+    piles of already-small files for no benefit. Returns a short outcome tag."""
+    if _is_work_file(p) or not _allowed(p):
+        return "skipped"
+    if has_open_job_for(str(p)):
+        return "skipped"
+    try:
+        probed = transcode.probe(p)
+    except Exception as e:
+        log.warning("probe failed for %s: %s", p, e)
+        return "error"
+    needs, reason = transcode.needs_transcode(probed)
+    if needs:
+        enqueue_path(p, reason=f"{reason_source}: {reason}")
+        return "enqueued"
+    # Under cap: leave the video alone, just enforce English-default audio.
+    try:
+        changed, msg = transcode.ensure_english_default(probed)
+        if changed:
+            log.info("audio-default fixed: %s (%s)", p, msg)
+            return "audio_fixed"
+    except Exception as e:
+        log.warning("audio-default fix failed for %s: %s", p, e)
+        return "error"
+    return "skipped"
+
+
 def enqueue_path(src: Path, reason: str = "manual") -> int | None:
     if not src.exists():
         raise FileNotFoundError(src)
@@ -194,6 +239,7 @@ def scan_and_enqueue() -> dict[str, int]:
     enqueued = 0
     skipped = 0
     errors = 0
+    audio_fixed = 0
     candidates: list[tuple[int, Path]] = []
     for root in MEDIA_ROOTS:
         if not root.exists():
@@ -204,7 +250,7 @@ def scan_and_enqueue() -> dict[str, int]:
                 continue
             if p.suffix.lower() not in transcode.VIDEO_EXTS:
                 continue
-            if not _allowed(p):
+            if _is_work_file(p) or not _allowed(p):
                 continue
             if has_open_job_for(str(p)):
                 continue
@@ -216,21 +262,19 @@ def scan_and_enqueue() -> dict[str, int]:
     candidates.sort(key=lambda x: x[0], reverse=True)
     log.info("scan: %d candidate files, probing biggest first", len(candidates))
     for _, p in candidates:
-        try:
-            probed = transcode.probe(p)
-        except Exception as e:
-            log.warning("probe failed for %s: %s", p, e)
-            errors += 1
-            continue
-        needs, reason = transcode.needs_transcode(probed)
-        if needs:
-            enqueue_path(p, reason=reason)
+        outcome = consider_file(p, "scan")
+        if outcome == "enqueued":
             enqueued += 1
+        elif outcome == "audio_fixed":
+            audio_fixed += 1
+        elif outcome == "error":
+            errors += 1
         else:
             skipped += 1
-    log.info("scan complete: enqueued=%d skipped=%d errors=%d",
-             enqueued, skipped, errors)
-    return {"enqueued": enqueued, "skipped": skipped, "errors": errors}
+    log.info("scan complete: enqueued=%d skipped=%d audio_fixed=%d errors=%d",
+             enqueued, skipped, audio_fixed, errors)
+    return {"enqueued": enqueued, "skipped": skipped,
+            "audio_fixed": audio_fixed, "errors": errors}
 
 
 def _worker_loop() -> None:
@@ -259,6 +303,12 @@ def _process_job(job_id: int) -> None:
         log.error("job %d disappeared", job_id)
         return
     src = Path(row["src_path"])
+    if _is_work_file(src):
+        log.warning("[job %d] source is a work file, discarding: %s", job_id, src)
+        update_job(job_id, status="discarded",
+                   error_msg="source is an intermediate work file",
+                   finished_at=time.time())
+        return
     if not src.exists():
         update_job(job_id, status="failed", error_msg="source missing",
                    finished_at=time.time())
@@ -478,18 +528,19 @@ def _watcher_loop() -> None:
             if p.is_dir() and (ev.mask & flags.CREATE):
                 _add_recursive(p)
                 continue
-            if p.suffix.lower() in transcode.VIDEO_EXTS:
+            if p.suffix.lower() in transcode.VIDEO_EXTS and not _is_work_file(p):
                 pending[p] = now + 30  # 30s settle
-        # Process settled files
+        # Process settled files. consider_file applies the same bitrate gate
+        # as the scan, so we no longer re-encode every new under-cap file.
         for p, t in list(pending.items()):
             if t <= now:
                 pending.pop(p, None)
                 if not p.exists():
                     continue
                 try:
-                    enqueue_path(p, reason="watcher")
+                    consider_file(p, "watcher")
                 except Exception as e:
-                    log.warning("watcher enqueue failed for %s: %s", p, e)
+                    log.warning("watcher consider failed for %s: %s", p, e)
 
 
 # -------------------- FastAPI app --------------------
@@ -497,6 +548,24 @@ def _watcher_loop() -> None:
 app = FastAPI(title="auto-transcode")
 templates = Jinja2Templates(directory="/app/templates")
 app.mount("/static", StaticFiles(directory="/app/static"), name="static")
+
+
+def _sweep_leftover_temps() -> int:
+    """Delete stranded ``*.transcoding.mkv`` temp files. No job can be active at
+    startup, so any such file is a partial output from a crashed/killed encode
+    and is safe to remove (the source is untouched; a new job regenerates it)."""
+    n = 0
+    for root in MEDIA_ROOTS:
+        if not root.exists():
+            continue
+        for p in root.rglob("*.transcoding.mkv"):
+            try:
+                p.unlink()
+                n += 1
+                log.info("swept leftover temp: %s", p)
+            except OSError as e:
+                log.warning("failed to sweep leftover temp %s: %s", p, e)
+    return n
 
 
 @app.on_event("startup")
@@ -514,6 +583,10 @@ def _startup() -> None:
         rows = c.execute("SELECT id FROM jobs WHERE status='queued'").fetchall()
     for row in rows:
         _worker_queue.put(row["id"])
+
+    swept = _sweep_leftover_temps()
+    if swept:
+        log.info("swept %d leftover .transcoding.mkv temp file(s)", swept)
 
     global _worker_thread, _watcher_thread
     _worker_thread = threading.Thread(target=_worker_loop, daemon=True, name="worker")

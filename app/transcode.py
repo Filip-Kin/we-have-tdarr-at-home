@@ -136,25 +136,97 @@ def maxrate_for_video(p: Probe) -> tuple[int, int]:
     canonical longest-side of each tier to handle slightly-cropped masters."""
     longest = max(int(p.video.get("width") or 0), int(p.video.get("height") or 0))
     if longest >= 3200:  # 4K UHD (3840 wide)
-        return 20_000, 40_000
+        return 25_000, 50_000
     if longest >= 1700:  # 1080p (1920 wide)
-        return 8_000, 16_000
+        return 12_000, 24_000
     if longest >= 1200:  # 720p (1280 wide)
-        return 4_000, 8_000
-    return 2_000, 4_000
+        return 6_000, 12_000
+    return 3_000, 6_000
 
 
 def needs_transcode(p: Probe) -> tuple[bool, str]:
-    """Decide whether this file needs transcoding. Returns (needs, reason)."""
-    if p.container != "matroska" and p.path.suffix.lower() != ".mkv":
-        return True, f"container={p.container}, want mkv"
-    if p.video_codec not in ("hevc", "vp9"):
-        return True, f"codec={p.video_codec}, want hevc/vp9"
+    """Decide whether this file needs transcoding. Returns (needs, reason).
+
+    We only transcode files that exceed the bitrate cap, i.e. ones genuinely
+    too fat for smooth LAN direct-play. Neither container nor codec is a
+    trigger: an h264/mp4 file under the cap direct-plays fine and re-encoding
+    it to HEVC just burns CPU, loses a generation of quality, and can hurt
+    playback compatibility for no storage benefit we need. When a file IS over
+    the cap we still re-encode to HEVC (.mkv) for the best quality-per-bit.
+    """
     cap_kbps, _ = maxrate_for_video(p)
     bitrate_kbps = p.video_bitrate_bps // 1000
     if bitrate_kbps > cap_kbps * 1.1:
         return True, f"bitrate={bitrate_kbps}kbps > cap={cap_kbps}kbps"
-    return False, "already hevc/vp9 mkv within bitrate cap"
+    return False, "within bitrate cap"
+
+
+def english_default_state(p: Probe) -> tuple[int | None, list[int]]:
+    """Returns (first_english_audio_idx, current_default_audio_idxs), where
+    indices are positions within p.audios (== ffmpeg output a:N order)."""
+    eng_idx = p.find_default_english_audio_idx()
+    defaults = [i for i, s in enumerate(p.audios)
+                if (s.get("disposition") or {}).get("default", 0) == 1]
+    return eng_idx, defaults
+
+
+def ensure_english_default(p: Probe) -> tuple[bool, str]:
+    """Make the first English audio track the sole default, using a
+    metadata-only edit (mkvpropedit for mkv, copy-remux for mp4/mov) so no
+    re-encode happens. Source mtime is preserved so Sonarr/Radarr don't
+    re-import. Returns (changed, message)."""
+    eng_idx, defaults = english_default_state(p)
+    if eng_idx is None:
+        return False, "no english audio track"
+    if defaults == [eng_idx]:
+        return False, "english already sole default"
+
+    path = p.path
+    st = path.stat()
+    is_mkv = p.container == "matroska" or path.suffix.lower() == ".mkv"
+    if is_mkv:
+        _set_default_mkv(path, len(p.audios), eng_idx)
+    else:
+        _set_default_remux(path, eng_idx)
+    os.utime(path, (st.st_atime, st.st_mtime))  # keep mtime stable
+    return True, f"set audio #{eng_idx} (eng) as sole default"
+
+
+def _set_default_mkv(path: Path, n_audios: int, eng_idx: int) -> None:
+    """In-place, no remux. mkvpropedit addresses audio tracks 1-based by type
+    in file order, matching the order of p.audios."""
+    cmd = ["mkvpropedit", str(path)]
+    for i in range(n_audios):
+        cmd += ["--edit", f"track:a{i + 1}",
+                "--set", f"flag-default={1 if i == eng_idx else 0}"]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    # 0 = ok, 1 = ok-with-warnings, 2 = error
+    if r.returncode >= 2:
+        raise RuntimeError(f"mkvpropedit rc={r.returncode}: {r.stderr.strip()}")
+
+
+def _set_default_remux(path: Path, eng_idx: int) -> None:
+    """Copy-remux to a temp file in the same dir (same fs -> atomic rename),
+    rewriting only the audio disposition. No quality loss."""
+    tmp = path.with_name(path.stem + ".audiofix" + path.suffix)
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+           "-i", str(path),
+           "-map", "0:v", "-map", "0:a", "-map", "0:s?",
+           "-map_metadata", "0", "-map_chapters", "0",
+           "-c", "copy",
+           "-disposition:a", "0", f"-disposition:a:{eng_idx}", "default",
+           str(tmp)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg remux rc={r.returncode}: {r.stderr.strip()[-300:]}")
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def build_ffmpeg_cmd(

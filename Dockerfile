@@ -2,6 +2,7 @@ FROM python:3.12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
+        mkvtoolnix \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir \
@@ -14,7 +15,9 @@ RUN mkdir -p /data && chown 33:33 /data
 VOLUME ["/data"]
 
 WORKDIR /app
-COPY app/ /app/
+# Own app files as the runtime user (33:33) so they're readable regardless of
+# the source tree's modes (edited files can land as 0770 root-owned otherwise).
+COPY --chown=33:33 app/ /app/
 
 ENV PYTHONUNBUFFERED=1
 EXPOSE 8128

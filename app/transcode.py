@@ -25,6 +25,26 @@ SUB_CONVERT = {"mov_text": "srt"}
 HDR_TRANSFERS = {"smpte2084", "arib-std-b67"}
 
 
+def _stream_bps(s: dict) -> int:
+    """Bitrate of a non-video stream. Its `bit_rate` field or `BPS` tag are
+    both trustworthy here because audio/subs are stream-copied (never
+    re-encoded), so -- unlike the video `BPS` tag -- they still describe the
+    current file after a transcode."""
+    br = s.get("bit_rate")
+    if br:
+        try:
+            return int(br)
+        except ValueError:
+            pass
+    bps = (s.get("tags") or {}).get("BPS")
+    if bps:
+        try:
+            return int(bps)
+        except ValueError:
+            pass
+    return 0
+
+
 @dataclass
 class Probe:
     path: Path
@@ -45,24 +65,35 @@ class Probe:
 
     @property
     def video_bitrate_bps(self) -> int:
-        """Best-effort bitrate. Falls back to file_size/duration if stream tag missing."""
+        """True video bitrate of the CURRENT file.
+
+        mkv remuxes carry no per-stream `bit_rate` field, only a `BPS`
+        statistics tag mkvmerge wrote once for the ORIGINAL remux -- and
+        ffmpeg copies that tag verbatim across re-encodes. Trusting it made
+        already-transcoded files loop forever: each pass read the stale high
+        number (e.g. Jumanji stuck at 34266 kbps while the file shrank
+        30->21->18 GB) and re-encoded again. So never read the video `BPS`
+        tag. Prefer the stream's real `bit_rate` field when present (accurate,
+        e.g. mp4/h264); otherwise derive video bitrate from ffprobe's
+        recomputed format bitrate (size/duration -- always current) minus the
+        stream-copied audio/subs. This reflects the current bytes and always
+        converges: after a transcode the video is <= cap, so the next probe
+        agrees and stops."""
         if br := self.video.get("bit_rate"):
             try:
                 return int(br)
             except ValueError:
                 pass
-        bps_tag = (self.video.get("tags") or {}).get("BPS")
-        if bps_tag:
-            try:
-                return int(bps_tag)
-            except ValueError:
-                pass
         fmt_br = (self.raw.get("format") or {}).get("bit_rate")
         if fmt_br:
             try:
-                return int(fmt_br)
+                total = int(fmt_br)
             except ValueError:
-                pass
+                total = 0
+            if total > 0:
+                other = sum(_stream_bps(s) for s in (*self.audios, *self.subs))
+                video = total - other
+                return video if video > 0 else total
         return 0
 
     @property
@@ -139,9 +170,10 @@ def maxrate_for_video(p: Probe) -> tuple[int, int]:
         return 25_000, 50_000
     if longest >= 1700:  # 1080p (1920 wide)
         return 12_000, 24_000
-    if longest >= 1200:  # 720p (1280 wide)
-        return 6_000, 12_000
-    return 3_000, 6_000
+    # 720p and below share the 1080p cap (Filip, 2026-07-11: "idc"). Below-cap
+    # SD/720p content just won't exceed 12 Mbps anyway, so this only stops us
+    # ever shrinking a low-res file -- which we didn't want to do regardless.
+    return 12_000, 24_000
 
 
 def needs_transcode(p: Probe) -> tuple[bool, str]:
